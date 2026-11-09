@@ -52,6 +52,14 @@ unsigned long lastPressTime = 0; // millis() of the last press
 int ledState = 0;
 bool pwmOn = false;
 
+TaskHandle_t camTaskHandle = NULL;
+TaskHandle_t jsonTaskHandle = NULL;
+TaskHandle_t buttonTaskHandle = NULL;
+
+SemaphoreHandle_t jsonMutex = NULL;
+
+
+
 void connectToWiFi(const char* ssid, const char* password)
 {
   WiFi.begin(ssid, password);
@@ -128,7 +136,11 @@ void startJSONServer(int port)
   jsonServer = WiFiServer(JSON_PORT);
   jsonServer.begin();
 }
-
+void updateJSON()
+{
+  json["buttonPresses"] = buttonPresses;
+  json["buttonPressTime"] = buttonPressTime;
+}
 void handleButtonPress() {
 
 int reading = digitalRead(BUTTON_PIN);
@@ -144,6 +156,7 @@ int reading = digitalRead(BUTTON_PIN);
         buttonPresses++;
         buttonPressTime = millis();
 
+        xSemaphoreTake(jsonMutex, portMAX_DELAY);
         updateJSON();
 
         String jsonString;
@@ -152,7 +165,7 @@ int reading = digitalRead(BUTTON_PIN);
        if (jsonClient.connected()) {
         jsonClient.println(jsonString);
        }
-      
+       xSemaphoreGive(jsonMutex);
 
       
       } else {
@@ -167,38 +180,9 @@ int reading = digitalRead(BUTTON_PIN);
 
 }
 
-void updateJSON()
-{
-  json["buttonPresses"] = buttonPresses;
-  json["buttonPressTime"] = buttonPressTime;
-}
 
-void setup()
-{
-  // Start the serial monitor
-  Serial.begin(9600);
-  Serial.setTimeout(10); // Timeout is needed to continue to camera processing quickly
 
-  // Button with internal pull up, LED off
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
 
-  // Connect to the SSID with PASSWORD
-  
-  connectToWiFi(SSID, PASSWORD);
-
-  // Start the camera server
-  startCameraServer(CAMERA_PORT);
-
-  // Start the JSON server
-  startJSONServer(JSON_PORT);
-
-  // Initialize the JSON
-  updateJSON();
-
-  Serial.println("Setup complete!");
-}
 
 bool sendJSONToClient(WiFiClient client)
 {
@@ -260,11 +244,77 @@ Serial.println(" %");
     Serial.println("Invalid JSON format");
   }
 }
+void sendImageToClientTask(void *parameter) {
+  while (true) {
+    if (!cameraClient.connected()) {
+      cameraClient = cameraServer.accept();
+    }
+    if (cameraClient.connected()) {
+      sendImageToClient(cameraClient);
+    }
+    vTaskDelay(1);
+  }
+}
+void handleJSONFromClientTask(void *parameter) {
+  while (true) {
+    xSemaphoreTake(jsonMutex, portMAX_DELAY);
+    if (!jsonClient.connected()) {
+      jsonClient = jsonServer.accept();
+      if (jsonClient) {
+        Serial.println("JSON client connected");
+        sendJSONToClient(jsonClient);
+      }
+    }
+    
+    if (jsonClient.connected() && jsonClient.available()) {
+      handleJSONFromClient(jsonClient);
+    }
+    xSemaphoreGive(jsonMutex);
+    vTaskDelay(1);
+  }
+}
+void buttonTask(void *parameter) {
+  while (true) {
+    handleButtonPress();
+    vTaskDelay(1);
+  }
+}
+void setup()
+{
+  // Start the serial monitor
+  Serial.begin(9600);
+  Serial.setTimeout(10); // Timeout is needed to continue to camera processing quickly
 
+  // Button with internal pull up, LED off
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // Connect to the SSID with PASSWORD
+  
+  connectToWiFi(SSID, PASSWORD);
+
+  // Start the camera server
+  startCameraServer(CAMERA_PORT);
+
+  // Start the JSON server
+  startJSONServer(JSON_PORT);
+
+  // Initialize the JSON
+  updateJSON();
+
+  Serial.println("Setup complete!");
+
+  jsonMutex = xSemaphoreCreateMutex();
+
+  xTaskCreate(sendImageToClientTask, "SendImageTask", 4096, NULL, 1, &camTaskHandle);
+  xTaskCreate(handleJSONFromClientTask, "HandleJSONTask", 4096, NULL, 1, &jsonTaskHandle);
+  xTaskCreate(buttonTask, "buttonTask", 4096, NULL, 1, &buttonTaskHandle);
+}
 void loop()
 {
 
-  handleButtonPress();
+  /*handleButtonPress();
    Check if a new camera client connected
  if (!cameraClient.connected()) cameraClient = cameraServer.accept();
 
@@ -286,7 +336,8 @@ void loop()
   }
 
   // Send an image to the camera client
-  if (cameraClient.connected()) sendImageToClient(cameraClient);
+  if (cameraClient.connected()) sendImageToClient(cameraClient); */
+  vTaskDelete(NULL); // Delete the loop task since we are using FreeRTOS tasks for everything
 
   
 }
